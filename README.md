@@ -13,7 +13,7 @@ Usage: ceph-rbd-backup.py ACTION [-h | --help] [--image IMAGE] [--debug]
 
 `-h` or `--help` displays a standard _usage_ screen.
 
-If `--image IMAGE` is specified, only this particular image is used, istead
+If `--image IMAGE` is specified, only this particular image is used, instead
 of all the images found in the production Cluster or mounted on a server. This
 affects all three actions `snapshot`, `replicate`, and `check`.
 
