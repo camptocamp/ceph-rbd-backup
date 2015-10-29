@@ -266,6 +266,9 @@ if __name__=="__main__":
       if args.image and volume.image != args.image: continue
       if not volume.mounted() and snapshot_mounted_only: continue
       logging.info("Creating snapshot for volume '%s'" %(volume.image))
+      if Stamp().now() in ceph_prod.snap_list_names(volume.image):
+        logging.error("Image '%s' already has snapshot '%s' - continuing with next image" %(volume.image, Stamp().now()))
+        continue
       try:
         if volume.mounted():
           volume.freeze()
