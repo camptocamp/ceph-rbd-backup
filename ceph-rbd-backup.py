@@ -223,9 +223,13 @@ class Volume:
     logging.debug("_vol_exec_raw out: " + out)
     return out
 
-  def _get_mountpoint(self):
-    ret = self._vol_exec_raw('findmnt', '-o', 'TARGET', '-n', self.device).strip()
-    return ret and ret or None
+  def _get_mountpoint(self, first_only=True):
+    ret = self._vol_exec_raw('findmnt', '-o', 'TARGET', '-n', self.device)
+    mpts = ret.strip().split("\n")
+    if first_only:
+      return mpts and mpts[0] or None
+    else:
+      return mpts
 
   def mounted(self):
     return self.mountpoint is not None
