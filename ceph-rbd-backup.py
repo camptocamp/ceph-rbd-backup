@@ -10,8 +10,8 @@ import sys
 ## stamp_day_after:
 # False = last snapshot and replicator run on same date
 # True = snapshots before midnight, replicator after midnight
-stamp_day_after = False
-#stamp_day_after = True
+#stamp_day_after = False
+stamp_day_after = True
 
 ## snapshot_mounted_only:
 # If True, only make snapshots of mounted volumes, otherwise
