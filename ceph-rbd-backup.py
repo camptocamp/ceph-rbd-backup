@@ -18,10 +18,15 @@ stamp_day_after = True
 # do it for all mapped rbd images
 snapshot_mounted_only = True
 
-## check_threshold_time
+## check_snapshot_threshold_time
 # Time of day after which the 'check' action will start reporting
-# missing replications and snapshots
-check_threshold_time = datetime.time(hour=8)
+# missing snapshots on production cluster
+check_snapshot_threshold_time = datetime.time(hour=1)
+
+## check_backup_threshold_time
+# Time of day after which the 'check' action will start reporting
+# missing replications on backup cluster
+check_backup_threshold_time = datetime.time(hour=21)
 
 ## Ceph credentials
 ceph_conf_prod = '/etc/ceph/ceph.conf'
@@ -170,22 +175,26 @@ class Replicator:
         continue
     logging.info("Finished replication of images to destination" + (errors and " (with errors)" or ""))
 
-  def check(self, threshold_time, single_image=None):
+  def check(self, src_threshold_time, dst_threshold_time, single_image=None):
     errors = []
     for image in self.src_rbd.list():
       if single_image and image != single_image: continue
-      if datetime.datetime.now().time() < threshold_time:
-        # Before threshold time, check for yesterdays (before latest) images on prod and backup clusters
+      if datetime.datetime.now().time() < src_threshold_time:
+        # Before threshold time, check for yesterdays (before latest) images on prod clusters
         if Stamp().yesterday() not in self.src_rbd.snap_list_names(image):
           errors.append("%s: missing snapshot %s on production cluster" %(image, Stamp().yesterday()) )
-        elif Stamp().yesterday() not in self.dst_rbd.snap_list_names(image):
+      else:
+        # After threshold time, check for image and todays (last) images on prod clusters
+        if Stamp().today() not in self.src_rbd.snap_list_names(image):
+          errors.append("%s: missing snapshot %s on production cluster" %(image, Stamp().today()) )
+      if datetime.datetime.now().time() < dst_threshold_time:
+        # Before threshold time, check for yesterdays (before latest) images on backup clusters
+        if Stamp().yesterday() not in self.dst_rbd.snap_list_names(image):
           errors.append("%s: missing snapshot %s on backup cluster" %(image, Stamp().yesterday()) )
       else:
-        # After threshold time, check for image and todays (last) images on prod and backup clusters
+        # After threshold time, check for image and todays (last) images on backup clusters
         if image not in self.dst_rbd.list():
           errors.append("%s: image missing on backup cluster" %(image))
-        elif Stamp().today() not in self.src_rbd.snap_list_names(image):
-          errors.append("%s: missing snapshot %s on production cluster" %(image, Stamp().today()) )
         elif Stamp().today() not in self.dst_rbd.snap_list_names(image):
           errors.append("%s: missing snapshot %s on backup cluster" %(image, Stamp().today()) )
     if not errors:
@@ -296,5 +305,5 @@ if __name__=="__main__":
     ceph_backup = Rbd(ceph_conf_backup, ceph_keyring_backup, ceph_username_backup)
     
     replicator = Replicator(ceph_prod, ceph_backup)
-    replicator.check(check_threshold_time, single_image=args.image)
+    replicator.check(check_snapshot_threshold_time, check_backup_threshold_time, single_image=args.image)
 
