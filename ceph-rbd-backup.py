@@ -7,27 +7,6 @@ import logging
 import sys
 
 
-## stamp_day_after:
-# False = last snapshot and replicator run on same date
-# True = snapshots before midnight, replicator after midnight
-#stamp_day_after = False
-stamp_day_after = True
-
-## snapshot_mounted_only:
-# If True, only make snapshots of mounted volumes, otherwise
-# do it for all mapped rbd images
-snapshot_mounted_only = True
-
-## check_snapshot_threshold_time
-# Time of day after which the 'check' action will start reporting
-# missing snapshots on production cluster
-check_snapshot_threshold_time = datetime.time(hour=1)
-
-## check_backup_threshold_time
-# Time of day after which the 'check' action will start reporting
-# missing replications on backup cluster
-check_backup_threshold_time = datetime.time(hour=21)
-
 ## Ceph credentials
 ceph_conf_prod = '/etc/ceph/ceph.conf'
 ceph_conf_backup = '/etc/ceph/ceph-backup.conf'
@@ -37,33 +16,12 @@ ceph_username_prod = 'rbd'
 ceph_username_backup = 'rbd_backup'
 
 
-
-class Stamp:
-  def __init__(self):
-    self.delta_days = stamp_day_after and 1 or 0
-
-  def today(self):
-    """ Last expected snapshot name at replication time """
-    return self._stamp(datetime.date.today() - datetime.timedelta(hours=self.delta_days*24))
-
-  def yesterday(self):
-    """ Before last expected snapshot name at replication time """
-    return self._stamp(datetime.date.today() - datetime.timedelta(hours=(self.delta_days+1)*24))
-
-  def now(self):
-    """ Snapshot name to use at snapshot creation time """
-    return self._stamp(datetime.date.today())
-
-  def _stamp(self, date):
-    return date.strftime("%Y-%m-%d")
-
-
-
 class Rbd:
-  def __init__(self, config, keyring, username):
+  def __init__(self, config, keyring, username, noop=False):
     self.config = config
     self.keyring = keyring
     self.username = username
+    self.noop = noop
 
   def _rbd_base_cmd(self, json=True):
     return ['rbd', '-c', self.config, '--keyring', self.keyring, '--id', self.username] + (json and ['--format', 'json'] or [])
@@ -80,18 +38,26 @@ class Rbd:
   def _rbd_exec_noout(self, *args):
     rbd_cmd = self._rbd_base_cmd(json=False) + list(args)
     logging.debug("_rbd_exec_noout cmd: " + repr(rbd_cmd))
+    if self.noop:
+      logging.info("_rbd_exec_noout noop! (%s)" %(' '.join(rbd_cmd)))
     rbd_sp = subprocess.Popen(rbd_cmd)
     out, err = rbd_sp.communicate()
 
   def _rbd_exec_pipe_source(self, *args):
     rbd_cmd = self._rbd_base_cmd(json=False) + list(args)
     logging.debug("_rbd_exec_pipe_source cmd: " + repr(rbd_cmd))
+    if self.noop:
+      logging.info("_rbd_exec_pipe_source noop! (%s)" %(' '.join(rbd_cmd)))
+      return None
     rbd_sp = subprocess.Popen(rbd_cmd, stdout=subprocess.PIPE)
     return rbd_sp.stdout
 
   def _rbd_exec_pipe_dest(self, source_pipe, *args):
     rbd_cmd = self._rbd_base_cmd(json=False) + list(args)
     logging.debug("_rbd_exec_pipe_dest cmd: " + repr(rbd_cmd))
+    if self.noop:
+      logging.info("_rbd_exec_pipe_dest noop! (%s)" %(' '.join(rbd_cmd)))
+      return None
     rbd_sp = subprocess.Popen(rbd_cmd, stdin=source_pipe, stdout=subprocess.PIPE)
     source_pipe.close() # ?
     out, err = rbd_sp.communicate()
@@ -122,95 +88,6 @@ class Rbd:
   def showmapped(self):
     return self._rbd_exec_simple('showmapped').values()
       
-
-
-class ReplicatorImageException(Exception):
-  pass
-
-
-class Replicator:
-  def __init__(self, src_rbd, dst_rbd):
-    self.src_rbd = src_rbd
-    self.dst_rbd = dst_rbd
-
-  def _replicate_snap_full(self, image):
-    logging.info("Doing full replication for image '%s'" %(image))
-    self.dst_rbd.import_diff(image, self.src_rbd.export_diff(image, Stamp().today()) )
-    
-  def _replicate_snap_diff(self, image):
-    logging.info("Doing diff replication for image '%s'" %(image))
-    if Stamp().yesterday() not in self.src_rbd.snap_list_names(image):
-      raise ReplicatorImageException("Source image '%s' doesn't have yesterday's snapshot" %(image))
-    if Stamp().yesterday() not in self.dst_rbd.snap_list_names(image):
-      raise ReplicatorImageException("Destination image '%s' doesn't have yesterday's snapshot" %(image))
-    self.dst_rbd.import_diff(image, self.src_rbd.export_diff(image, Stamp().today(), Stamp().yesterday()) )
-
-  def replicate(self, single_image=None):
-    logging.info("Starting replication of images to destination")
-    errors = False
-    for image in self.src_rbd.list():
-      if single_image and image != single_image: continue
-      logging.info("Replicating image '%s'" %(image))
-      try:
-        # Check existing snapshot on source (must exist)
-        if Stamp().today() not in self.src_rbd.snap_list_names(image):
-          raise ReplicatorImageException("Source image '%s' doesn't have today's snapshot %s" %(image, Stamp().today()))
-        # If image doesn't exist on destination, create it
-        if image not in self.dst_rbd.list():
-          logging.info("Creating new image '%s' on destination" %(image))
-          self.dst_rbd.create(image, 1)
-          if image not in self.dst_rbd.list():
-            raise ReplicatorImageException("Error creating new image '%s' on destination" %(image))
-        # Check existing snapshot on destination (must not exist)
-        if Stamp().today() in self.dst_rbd.snap_list_names(image):
-          raise ReplicatorImageException("Destination image '%s' already has today's snapshot" %(image))
-        # If destination has no snapshot, do full replication
-        if not self.dst_rbd.snap_list_names(image):
-          self._replicate_snap_full(image)
-        else:
-          self._replicate_snap_diff(image)
-      except ReplicatorImageException, e:
-        errors = True
-        logging.error(e.message + " - continuing with next image")
-        continue
-    logging.info("Finished replication of images to destination" + (errors and " (with errors)" or ""))
-
-  def check(self, src_threshold_time, dst_threshold_time, single_image=None):
-    errors = []
-    for image in self.src_rbd.list():
-      if single_image and image != single_image: continue
-      if datetime.datetime.now().time() < src_threshold_time:
-        # Before threshold time, check for yesterdays (before latest) images on prod clusters
-        if Stamp().yesterday() not in self.src_rbd.snap_list_names(image):
-          errors.append("%s: missing snapshot %s on production cluster" %(image, Stamp().yesterday()) )
-      else:
-        # After threshold time, check for image and todays (last) images on prod clusters
-        if Stamp().today() not in self.src_rbd.snap_list_names(image):
-          errors.append("%s: missing snapshot %s on production cluster" %(image, Stamp().today()) )
-      if datetime.datetime.now().time() < dst_threshold_time:
-        # Before threshold time, check for yesterdays (before latest) images on backup clusters
-        if Stamp().yesterday() not in self.dst_rbd.snap_list_names(image):
-          errors.append("%s: missing snapshot %s on backup cluster" %(image, Stamp().yesterday()) )
-      else:
-        # After threshold time, check for image and todays (last) images on backup clusters
-        if image not in self.dst_rbd.list():
-          errors.append("%s: image missing on backup cluster" %(image))
-        elif Stamp().today() not in self.dst_rbd.snap_list_names(image):
-          errors.append("%s: missing snapshot %s on backup cluster" %(image, Stamp().today()) )
-    if not errors:
-      descr = single_image and "Backup for image %s"%(single_image) or "All backups"
-      print "BACKUP OK - %s OK" %(descr)
-      sys.exit(0)
-    elif len(errors) == 1:
-      print "BACKUP ERROR - %s" %(errors[0])
-      sys.exit(2)
-    else:
-      print "BACKUP ERROR - %d errors\n%s" %(len(errors), "\n".join(errors))
-      sys.exit(2)
-
-
-class VolumeException(Exception):
-  pass
 
 class Volume:
   def __init__(self, image, device):
@@ -254,7 +131,6 @@ class Volume:
       raise VolumeException("Cannot unfreeze not mounted volume '%s'" %(self.device))
     self._vol_exec_raw('fsfreeze', '--unfreeze', self.mountpoint)
     self.frozen = False
- 
 
 
 if __name__=="__main__":
@@ -264,46 +140,77 @@ if __name__=="__main__":
   parser.add_argument('action', help='action to perform', choices=['replicate', 'snapshot', 'check'])
   parser.add_argument('--image', help='single image to process instead of all')
   parser.add_argument('--debug', help='enable debug logging', action='store_true')
+  parser.add_argument('--noop', help='don\'t do any action, only log', action='store_true')
   args = parser.parse_args()
 
   level = args.debug and logging.DEBUG or logging.INFO
   logging.basicConfig(format='%(levelname)s %(message)s', level=level)
 
-  if args.action == "snapshot":
-    ceph_prod = Rbd(ceph_conf_prod, ceph_keyring_prod, ceph_username_prod)
-    volumes = [Volume(m['name'], m['device']) for m in ceph_prod.showmapped()]
+  ceph_prod = Rbd(ceph_conf_prod, ceph_keyring_prod, ceph_username_prod, args.noop)
+  ceph_backup = Rbd(ceph_conf_backup, ceph_keyring_backup, ceph_username_backup, args.noop)
 
+  if args.action == "snapshot":
+    volumes = [Volume(m['name'], m['device']) for m in ceph_prod.showmapped()]
     logging.info("Starting snapshot of all mounted volumes")
     errors = False
     for volume in volumes:
       if args.image and volume.image != args.image: continue
       if not volume.mounted() and snapshot_mounted_only: continue
       logging.info("Creating snapshot for volume '%s'" %(volume.image))
-      if Stamp().now() in ceph_prod.snap_list_names(volume.image):
-        logging.error("Image '%s' already has snapshot '%s' - continuing with next image" %(volume.image, Stamp().now()))
+      today = datetime.date.today().strftime("%Y-%m-%d")
+      if today in ceph_prod.snap_list_names(volume.image):
+        logging.error("Image '%s' already has snapshot '%s' - continuing with next image" %(volume.image, today))
         continue
       try:
         if volume.mounted():
           volume.freeze()
-        ceph_prod.snap_create(volume.image, Stamp().now())
+        ceph_prod.snap_create(volume.image, today)
         if volume.mounted():
           volume.unfreeze()
       except VolumeException, e:
         logging.error(e.message + " - continuing with next volume")
         continue
     logging.info("Finished snapshot of all mounted volumes" + (errors and " (with errors)" or ""))
-    
+
   elif args.action == "replicate":
-    ceph_prod = Rbd(ceph_conf_prod, ceph_keyring_prod, ceph_username_prod)
-    ceph_backup = Rbd(ceph_conf_backup, ceph_keyring_backup, ceph_username_backup)
-    
-    replicator = Replicator(ceph_prod, ceph_backup)
-    replicator.replicate(single_image=args.image)
+    logging.info("Starting replication of images to destination")
+    for image in ceph_prod.list():
+      if args.image and image != args.image: continue
+      logging.info("Replicating image '%s'" %(image))
+      if image not in ceph_backup.list():
+        logging.info("Creating new image '%s' on destination" %(image))
+        ceph_backup.create(image, 1)
+      latest_bk_snap = ceph_backup.snap_list_names(image)[-1]
+      latest_prd_snap = ceph_prod.snap_list_names(image)[-1]
+      if latest_bk_snap == latest_prd_snap:
+        logging.error("Latest snapshot '%s' for image '%s' already present on backup - skipping" %(latest_prd_snap, image))
+        continue
+      elif latest_bk_snap not in ceph_prod.snap_list_names(image):
+        logging.info("Latest backup snapshot '%s' for image '%s' missing on prod, doing full replication" %(latest_bk_snap, image))
+        ceph_backup.import_diff(image, ceph_prod.export_diff(image, latest_prd_snap) )
+      else:
+        logging.info("Doing diff replication for image '%s'" %(image))
+        ceph_backup.import_diff(image, ceph_prod.export_diff(image, latest_prd_snap, latest_bk_snap) )
 
   elif args.action == "check":
-    ceph_prod = Rbd(ceph_conf_prod, ceph_keyring_prod, ceph_username_prod)
-    ceph_backup = Rbd(ceph_conf_backup, ceph_keyring_backup, ceph_username_backup)
-    
-    replicator = Replicator(ceph_prod, ceph_backup)
-    replicator.check(check_snapshot_threshold_time, check_backup_threshold_time, single_image=args.image)
+    errors = []
+    for image in ceph_prod.list():
+      if args.image and image != args.image: continue
+      latest_bk_snap = ceph_backup.snap_list_names(image)[-1]
+      before_latest_bk_snap = ceph_backup.snap_list_names(image)[-2]
+      latest_prd_snap = ceph_prod.snap_list_names(image)[-1]
+      if image not in ceph_backup.list():
+        errors.append("%s: missing image on backup cluster" %(image))
+      elif latest_bk_snap != latest_prd_snap and before_latest_bk_snap != latest_prd_snap:
+        errors.append("%s: latest or before latest backup snapshot %s not up-to-date with production %s" %(image, latest_bk_snap, latest_prd_snap))
+    if not errors:
+      descr = args.image and "Backup for image %s"%(args.image) or "All backups"
+      print "BACKUP OK - %s OK" %(descr)
+      sys.exit(0)
+    elif len(errors) == 1:
+      print "BACKUP ERROR - %s" %(errors[0])
+      sys.exit(2)
+    else:
+      print "BACKUP ERROR - %d errors\n%s" %(len(errors), "\n".join(errors))
+      sys.exit(2)
 
