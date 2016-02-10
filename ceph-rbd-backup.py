@@ -5,6 +5,7 @@ import subprocess
 import datetime
 import logging
 import sys
+import os
 
 
 ## Ceph credentials
@@ -15,6 +16,7 @@ ceph_keyring_backup = '/etc/ceph/ceph.client.rbd_backup.keyring'
 ceph_username_prod = 'rbd'
 ceph_username_backup = 'rbd_backup'
 
+replication_lockfile_pattern = '/tmp/ceph-rbd-back-%s.lock'
 
 class Rbd:
   def __init__(self, config, keyring, username, noop=False):
@@ -177,6 +179,10 @@ if __name__=="__main__":
     for image in ceph_prod.list():
       if args.image and image != args.image: continue
       logging.info("Replicating image '%s'" %(image))
+      if os.path.exists(replication_lockfile_pattern %(image)):
+        logging.info("Lock file found, skipping replication")
+        continue
+      open(replication_lockfile_pattern %(image),'w')
       if image not in ceph_backup.list():
         logging.info("Creating new image '%s' on destination" %(image))
         ceph_backup.create(image, 1)
@@ -184,6 +190,7 @@ if __name__=="__main__":
       latest_prd_snap = ceph_prod.snap_list_names(image)[-1]
       if latest_bk_snap == latest_prd_snap:
         logging.error("Latest snapshot '%s' for image '%s' already present on backup - skipping" %(latest_prd_snap, image))
+        os.unlink(replication_lockfile_pattern %(image))
         continue
       elif latest_bk_snap not in ceph_prod.snap_list_names(image):
         logging.info("Latest backup snapshot '%s' for image '%s' missing on prod, doing full replication" %(latest_bk_snap, image))
@@ -191,6 +198,7 @@ if __name__=="__main__":
       else:
         logging.info("Doing diff replication for image '%s'" %(image))
         ceph_backup.import_diff(image, ceph_prod.export_diff(image, latest_prd_snap, latest_bk_snap) )
+      os.unlink(replication_lockfile_pattern %(image))
 
   elif args.action == "check":
     errors = []
