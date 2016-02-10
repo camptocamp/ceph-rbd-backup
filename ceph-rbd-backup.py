@@ -197,12 +197,11 @@ if __name__=="__main__":
     for image in ceph_prod.list():
       if args.image and image != args.image: continue
       latest_bk_snap = ceph_backup.snap_list_names(image)[-1]
-      before_latest_bk_snap = ceph_backup.snap_list_names(image)[-2]
-      latest_prd_snap = ceph_prod.snap_list_names(image)[-1]
+      latest_prd_snaps = ceph_prod.snap_list_names(image)[-2:]
       if image not in ceph_backup.list():
         errors.append("%s: missing image on backup cluster" %(image))
-      elif latest_bk_snap != latest_prd_snap and before_latest_bk_snap != latest_prd_snap:
-        errors.append("%s: latest or before latest backup snapshot %s not up-to-date with production %s" %(image, latest_bk_snap, latest_prd_snap))
+      elif latest_bk_snap not in latest_prd_snaps:
+        errors.append("%s: latest backup snapshot %s not up-to-date with production %s" %(image, latest_bk_snap, latest_prd_snaps[-1]))
     if not errors:
       descr = args.image and "Backup for image %s"%(args.image) or "All backups"
       print "BACKUP OK - %s OK" %(descr)
