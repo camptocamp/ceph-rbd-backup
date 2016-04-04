@@ -186,8 +186,16 @@ if __name__=="__main__":
       if image not in ceph_backup.list():
         logging.info("Creating new image '%s' on destination" %(image))
         ceph_backup.create(image, 1)
-      latest_bk_snap = ceph_backup.snap_list_names(image)[-1]
-      latest_prd_snap = ceph_prod.snap_list_names(image)[-1]
+      try:
+        latest_bk_snap = ceph_backup.snap_list_names(image)[-1]
+      except IndexError:
+        latest_bk_snap = None
+      try:
+        latest_prd_snap = ceph_prod.snap_list_names(image)[-1]
+      except IndexError:
+        logging.error("No snapshots on prod for image '%s' - continuing with next image" %(image))
+        os.unlink(replication_lockfile_pattern %(image))
+        continue
       if latest_bk_snap == latest_prd_snap:
         logging.error("Latest snapshot '%s' for image '%s' already present on backup - skipping" %(latest_prd_snap, image))
         os.unlink(replication_lockfile_pattern %(image))
