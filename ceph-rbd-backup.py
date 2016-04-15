@@ -213,7 +213,10 @@ if __name__=="__main__":
     errors = []
     for image in ceph_prod.list():
       if args.image and image != args.image: continue
-      latest_bk_snap = ceph_backup.snap_list_names(image)[-1]
+      try:
+        latest_bk_snap = ceph_backup.snap_list_names(image)[-1]
+      except IndexError:
+        latest_bk_snap = None
       latest_prd_snaps = ceph_prod.snap_list_names(image)[-2:]
       if image not in ceph_backup.list():
         errors.append("%s: missing image on backup cluster" %(image))
