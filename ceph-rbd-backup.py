@@ -42,6 +42,7 @@ class Rbd:
     logging.debug("_rbd_exec_noout cmd: " + repr(rbd_cmd))
     if self.noop:
       logging.info("_rbd_exec_noout noop! (%s)" %(' '.join(rbd_cmd)))
+      return None
     rbd_sp = subprocess.Popen(rbd_cmd)
     out, err = rbd_sp.communicate()
 
