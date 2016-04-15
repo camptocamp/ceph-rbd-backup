@@ -6,6 +6,7 @@ import datetime
 import logging
 import sys
 import os
+import ConfigParser
 
 
 ## Ceph credentials
@@ -15,6 +16,8 @@ ceph_keyring_prod = '/etc/ceph/ceph.client.rbd.keyring'
 ceph_keyring_backup = '/etc/ceph/ceph.client.rbd_backup.keyring'
 ceph_username_prod = 'rbd'
 ceph_username_backup = 'rbd_backup'
+
+rbd_backup_conf = '/etc/ceph/ceph-rbd-backup.conf'
 
 replication_lockfile_pattern = '/tmp/ceph-rbd-back-%s.lock'
 
@@ -81,6 +84,9 @@ class Rbd:
   def snap_create(self, image_name, snap_name):
     self._rbd_exec_noout('snap', 'create', image_name, '--snap', snap_name)
 
+  def snap_rm(self, image_name, snap_name):
+    self._rbd_exec_noout('snap', 'rm', image_name, '--snap', snap_name)
+
   def export_diff(self, image_name, snap_name, from_snap_name=None):
     from_snap_args = from_snap_name and ['--from_snap', from_snap_name] or []
     return self._rbd_exec_pipe_source('export-diff', image_name, '-', '--snap', snap_name, *from_snap_args)
@@ -140,7 +146,7 @@ if __name__=="__main__":
 
   import argparse
   parser = argparse.ArgumentParser(description='Ceph backup / replication tool')
-  parser.add_argument('action', help='action to perform', choices=['replicate', 'snapshot', 'check'])
+  parser.add_argument('action', help='action to perform', choices=['replicate', 'snapshot', 'expire', 'check'])
   parser.add_argument('--image', help='single image to process instead of all')
   parser.add_argument('--debug', help='enable debug logging', action='store_true')
   parser.add_argument('--noop', help='don\'t do any action, only log', action='store_true')
@@ -148,6 +154,13 @@ if __name__=="__main__":
 
   level = args.debug and logging.DEBUG or logging.INFO
   logging.basicConfig(format='%(levelname)s %(message)s', level=level)
+
+  config = ConfigParser.RawConfigParser()
+  if os.path.exists(rbd_backup_conf):
+    logging.debug("Reading configuration file")
+    config.read(rbd_backup_conf)
+  else:
+    logging.debug("No configuration found")
 
   ceph_prod = Rbd(ceph_conf_prod, ceph_keyring_prod, ceph_username_prod, args.noop)
   ceph_backup = Rbd(ceph_conf_backup, ceph_keyring_backup, ceph_username_backup, args.noop)
@@ -232,4 +245,26 @@ if __name__=="__main__":
     else:
       print "BACKUP ERROR - %d errors\n%s" %(len(errors), "\n".join(errors))
       sys.exit(2)
+
+  elif args.action == "expire":
+    for image in ceph_prod.list():
+      if args.image and image != args.image: continue
+      try:
+        prod_oldest_to_keep = (datetime.date.today() - datetime.timedelta(days=config.getint(image, 'prod_retention'))).strftime("%Y-%m-%d")
+        prod_to_delete = [snap for snap in ceph_prod.snap_list_names(image) if snap < prod_oldest_to_keep]
+      except ConfigParser.NoSectionError, ConfigParser.NoOptionError:
+        logging.warn("No retention configured for image '%s' on prod - not removing snapshots" %(image))
+        prod_to_delete = []
+      try:
+        backup_oldest_to_keep = (datetime.date.today() - datetime.timedelta(days=config.getint(image, 'backup_retention'))).strftime("%Y-%m-%d")
+        backup_to_delete = [snap for snap in ceph_backup.snap_list_names(image) if snap < backup_oldest_to_keep]
+      except ConfigParser.NoSectionError, ConfigParser.NoOptionError:
+        logging.info("No retention configured for image '%s' on backup - not removing snapshots" %(image))
+        backup_to_delete = []
+      for snap in prod_to_delete:
+        logging.info("Deleting expired snapshot '%s' of image '%s' on prod" %(snap, image))
+        ceph_prod.snap_rm(image, snap)
+      for snap in backup_to_delete:
+        logging.info("Deleting expired snapshot '%s' of image '%s' on backup" %(snap, image))
+        ceph_backup.snap_rm(image, snap)
 
