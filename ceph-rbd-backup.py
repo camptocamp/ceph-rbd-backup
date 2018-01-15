@@ -16,6 +16,7 @@ ceph_keyring_prod = '/etc/ceph/ceph.client.rbd.keyring'
 ceph_keyring_backup = '/etc/ceph/ceph.client.rbd_backup.keyring'
 ceph_username_prod = 'rbd'
 ceph_username_backup = 'rbd_backup'
+ceph_snapshots_mount_path = '/mnt/ceph-snapshots'
 
 rbd_backup_conf = '/etc/ceph/ceph-rbd-backup.conf'
 
@@ -30,6 +31,14 @@ class Rbd:
 
   def _rbd_base_cmd(self, json=True):
     return ['rbd', '-c', self.config, '--keyring', self.keyring, '--id', self.username] + (json and ['--format', 'json'] or [])
+
+  def _rbd_exec_plain(self, *args):
+    rbd_cmd = self._rbd_base_cmd(json=False) + list(args)
+    logging.debug("_rbd_exec_plain cmd: " + repr(rbd_cmd))
+    rbd_sp = subprocess.Popen(rbd_cmd, stdout=subprocess.PIPE)
+    out, err = rbd_sp.communicate()
+    logging.debug("_rbd_exec_plain stdout: " + out)
+    return out.strip()
 
   def _rbd_exec_simple(self, *args):
     rbd_cmd = self._rbd_base_cmd() + list(args)
@@ -97,6 +106,12 @@ class Rbd:
   def showmapped(self):
     return self._rbd_exec_simple('showmapped').values()
       
+  def map(self, image_name, snap_name):
+    return self._rbd_exec_plain('map', image_name, '--snap', snap_name, '-o', 'ro')
+
+  def unmap(self, device):
+    self._rbd_exec_noout('unmap', device)
+
 
 class Volume:
   def __init__(self, image, device):
@@ -142,11 +157,46 @@ class Volume:
     self.frozen = False
 
 
+class Mount:
+  def __init__(self, path, device=None, options=[]):
+    self.path = path
+    self.device = device
+    self.options = options
+
+  def _mount_exec_noout(self, *args):
+    logging.debug("_mount_exec_raw cmd: " + repr(args))
+    sp_mount = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = sp_mount.communicate()
+    logging.debug("_mount_exec_raw out: " + out)
+    logging.debug("_mount_exec_raw err: " + err)
+
+  def mkdirs(self):
+    if not os.path.exists(self.path):
+      os.makedirs(self.path)
+    return self
+
+  def rmdir(self):
+    if os.path.isdir(self.path):
+      os.rmdir(self.path)
+    return self
+
+  def mount(self):
+    if self.device is None:
+      raise MountException('Mount.mount() requires a device')
+    self.mkdirs()
+    self._mount_exec_noout('mount', self.device, self.path)
+    return self
+
+  def umount(self):
+    self._mount_exec_noout('umount', self.path)
+    return self
+
+
 if __name__=="__main__":
 
   import argparse
   parser = argparse.ArgumentParser(description='Ceph backup / replication tool')
-  parser.add_argument('action', help='action to perform', choices=['replicate', 'snapshot', 'expire', 'check'])
+  parser.add_argument('action', help='action to perform', choices=['replicate', 'snapshot', 'expire', 'mount', 'check'])
   parser.add_argument('--image', help='single image to process instead of all')
   parser.add_argument('--debug', help='enable debug logging', action='store_true')
   parser.add_argument('--noop', help='don\'t do any action, only log', action='store_true')
@@ -166,7 +216,7 @@ if __name__=="__main__":
   ceph_backup = Rbd(ceph_conf_backup, ceph_keyring_backup, ceph_username_backup, args.noop)
 
   if args.action == "snapshot":
-    volumes = [Volume(m['name'], m['device']) for m in ceph_prod.showmapped()]
+    volumes = [Volume(m['name'], m['device']) for m in ceph_prod.showmapped() if m['snap'] == '-']
     logging.info("Starting snapshot of all mounted volumes")
     errors = False
     for volume in volumes:
@@ -269,3 +319,30 @@ if __name__=="__main__":
         logging.info("Deleting expired snapshot '%s' of image '%s' on backup" %(snap, image))
         ceph_backup.snap_rm(image, snap)
 
+  elif args.action == "mount":
+    for image in ceph_prod.list():
+      if args.image and image != args.image: continue
+      if not config.has_option(image, 'mount_snapshots'): continue
+      logging.info("Checking snapshots mounts for image '%s'" %(image))
+      oldest_to_mount = (datetime.date.today() - datetime.timedelta(days=config.getint(image, 'mount_snapshots'))).strftime("%Y-%m-%d")
+      # cleanup old mounted + dir
+      snaps_dirs = os.listdir(os.path.join(ceph_snapshots_mount_path, image))
+      print snaps_dirs
+      for snap in snaps_dirs:
+        if snap < oldest_to_mount:
+          logging.info("Unmounting + rmdir snapshot '%s' of image '%s'" %(snap, image))
+          Mount(os.path.join(ceph_snapshots_mount_path, image, snap)).umount().rmdir()
+      # cleanup old mapped
+      mapped = dict([(m['snap'], m['device']) for m in ceph_prod.showmapped() if m['name'] == image and m['snap'] != '-'])
+      for snap in mapped:
+        if snap < oldest_to_mount:
+          logging.info("Unmapping snapshot '%s' of image '%s'" %(snap, image))
+          ceph_prod.unmap(mapped[snap])
+      # mount new snapshots
+      for i in range(config.getint(image, 'mount_snapshots'), 0, -1):
+        snap = (datetime.date.today() - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+        snap_dir = os.path.join(ceph_snapshots_mount_path, image, snap)
+        if snap not in mapped:
+          logging.info("Mounting snapshot '%s' of image '%s'" %(snap, image))
+          device = ceph_prod.map(image, snap)
+          Mount(snap_dir, device).mount()
