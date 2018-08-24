@@ -300,24 +300,24 @@ if __name__=="__main__":
   elif args.action == "expire":
     for image in ceph_prod.list():
       if args.image and image != args.image: continue
-      if image not in ceph_backup.list():
-        logging.warn("Missing image '%s' on backup cluster" %(image))
-        continue
       try:
         prod_oldest_to_keep = (datetime.date.today() - datetime.timedelta(days=config.getint(image, 'prod_retention'))).strftime("%Y-%m-%d")
         prod_to_delete = [snap for snap in ceph_prod.snap_list_names(image) if snap < prod_oldest_to_keep]
       except ConfigParser.NoSectionError, ConfigParser.NoOptionError:
         logging.warn("No retention configured for image '%s' on prod - not removing snapshots" %(image))
         prod_to_delete = []
+      for snap in prod_to_delete:
+        logging.info("Deleting expired snapshot '%s' of image '%s' on prod" %(snap, image))
+        ceph_prod.snap_rm(image, snap)
+      if image not in ceph_backup.list():
+        logging.warn("Missing image '%s' on backup cluster" %(image))
+        continue
       try:
         backup_oldest_to_keep = (datetime.date.today() - datetime.timedelta(days=config.getint(image, 'backup_retention'))).strftime("%Y-%m-%d")
         backup_to_delete = [snap for snap in ceph_backup.snap_list_names(image) if snap < backup_oldest_to_keep]
       except ConfigParser.NoSectionError, ConfigParser.NoOptionError:
         logging.info("No retention configured for image '%s' on backup - not removing snapshots" %(image))
         backup_to_delete = []
-      for snap in prod_to_delete:
-        logging.info("Deleting expired snapshot '%s' of image '%s' on prod" %(snap, image))
-        ceph_prod.snap_rm(image, snap)
       for snap in backup_to_delete:
         logging.info("Deleting expired snapshot '%s' of image '%s' on backup" %(snap, image))
         ceph_backup.snap_rm(image, snap)
